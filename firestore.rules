@@ -1,0 +1,123 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny Catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- PHASE 3: Primitives & Global Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Role-based Access Control
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.email == 'yashchate63@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- PHASE 2: Validation Blueprints ---
+
+    function isValidUser(data) {
+      return data.uid is string
+        && data.balance is number
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && (data.get('displayName', '') is string)
+        && (data.get('email', '') is string)
+        && (data.get('referralCode', '') is string)
+        && (data.get('completedTasks', []) is list);
+    }
+
+    function isValidTask(data) {
+      return data.title is string && data.title.size() <= 100
+        && data.reward is number && data.reward >= 0
+        && data.link is string && data.link.size() <= 500
+        && data.createdAt is timestamp;
+    }
+
+    function isValidWithdrawal(data) {
+      return data.userId is string && data.userId.size() <= 128
+        && data.amount is number && data.amount > 0
+        && data.method is string && data.method.size() <= 50
+        && data.status in ['Pending', 'Processing', 'Completed', 'Rejected']
+        && data.timestamp is timestamp;
+    }
+
+    // --- Connection Test ---
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // --- Users Collection ---
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+      
+      allow create: if isOwner(userId) 
+        && isValidId(userId)
+        && incoming().uid == userId
+        && incoming().balance == 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isValidUser(incoming());
+
+      allow update: if (isOwner(userId) || isAdmin())
+        && isValidUser(incoming())
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Profile Update (User can update specific allowed fields)
+          (isOwner(userId) 
+            && incoming().uid == existing().uid 
+            && incoming().createdAt == existing().createdAt
+            && (incoming().diff(existing()).affectedKeys().hasOnly(['balance', 'completedTasks', 'updatedAt', 'displayName']))) ||
+          isAdmin()
+        );
+    }
+
+    // --- Tasks Collection ---
+    match /tasks/{taskId} {
+      allow list, get: if isSignedIn();
+      allow create, update, delete: if isAdmin() 
+        && (request.method != 'create' || (isValidTask(incoming()) && incoming().createdAt == request.time));
+    }
+
+    // --- Withdrawal Requests ---
+    match /withdrawalRequests/{requestId} {
+      allow list: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow get: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      
+      allow create: if isSignedIn()
+        // && isEmailVerified() // Relaxed for better UX during development
+        && incoming().userId == request.auth.uid
+        && incoming().status == 'Pending'
+        && incoming().timestamp == request.time
+        && isValidWithdrawal(incoming());
+
+      allow update: if isAdmin()
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status'])
+        && incoming().status in ['Completed', 'Rejected', 'Pending', 'Processing']
+        && incoming().timestamp == existing().timestamp; // Immutable timestamp
+    }
+  }
+}
